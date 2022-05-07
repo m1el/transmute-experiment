@@ -9,7 +9,7 @@ mod print;
 mod ty;
 
 use print::Printer;
-use derive::{MakeTy, derive_ty};
+use derive::{InspectTy, derive_ty};
 use crate::compiler::Compiler;
 use crate::inst::Program;
 use crate::ty::*;
@@ -46,21 +46,19 @@ fn main() {
     //     nothing: (),
     //     something: u128,
     // }
+    // safe_transmute::<Pb, Au>
     // safe_transmute<[u8; 16], U>([0; 16]) // goood
     // safe_transmute<U, [u8; 16]>(U { nothing: () }) // bad
     let ty = Bar::ty_of();
-    if true {
-        // let mut printer = Printer::new();
-        // println!("{}", printer.print_rust(&ty).unwrap());
-        let mut printer = Printer::new();
-        println!("{}", printer.print_c(&ty).unwrap());
-        println!("{}", printer.print_rust(&ty).unwrap());
-    } else {
-        let endian = if true { Endian::Little } else { Endian::Big };
-        let mut compiler = Compiler::new(endian);
-        compiler.extend_from_ty(&ty);
-        println!("comp layout: {:?}", compiler.layout);
-        let prog = Program { insts: compiler.insts };
-        println!("{:?}", prog);
-    }
+    // let mut printer = Printer::new();
+    // println!("{}", printer.print_rust(&ty).unwrap());
+    let mut printer = Printer::new();
+    println!("{}", printer.print_c(&ty).unwrap());
+    println!("{}", printer.print_rust(&ty).unwrap());
+    let endian = if true { Endian::Little } else { Endian::Big };
+    let mut compiler = Compiler::new(endian);
+    compiler.extend_from_ty(&ty);
+    println!("comp layout: {:?}", compiler.layout);
+    let prog = Program { insts: compiler.insts };
+    println!("{:?}", prog);
 }
