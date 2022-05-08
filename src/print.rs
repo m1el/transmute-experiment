@@ -17,6 +17,8 @@ impl<'t> Printer<'t> {
             Ty::Void => "Zst".into(),
             Ty::Bool => "bool".into(),
             Ty::Int(sz) => format!("u{}", sz * 8),
+            Ty::Ptr(_) => unimplemented!("pointer"),
+            Ty::Ref(_) => unimplemented!("reference"),
             Ty::Array(_) => {
                 panic!("c doesn't have a good type name for arrays");
             }
@@ -42,6 +44,8 @@ impl<'t> Printer<'t> {
             Ty::Void => "()".into(),
             Ty::Bool => "bool".into(),
             Ty::Int(sz) => format!("u{}", sz * 8),
+            Ty::Ptr(_) => unimplemented!("pointer"),
+            Ty::Ref(_) => unimplemented!("reference"),
             Ty::Array(ref arr) => {
                 let ty = self.rust_name_for(&arr.element);
                 format!("[{}; {}]", ty, arr.count)

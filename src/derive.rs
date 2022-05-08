@@ -12,6 +12,26 @@ impl InspectTy for u8   { fn ty_of() -> Ty { Ty::Int(1) }  }
 impl InspectTy for u16  { fn ty_of() -> Ty { Ty::Int(2) }  }
 impl InspectTy for u32  { fn ty_of() -> Ty { Ty::Int(4) }  }
 impl InspectTy for u64  { fn ty_of() -> Ty { Ty::Int(8) }  }
+impl InspectTy for i8   { fn ty_of() -> Ty { Ty::Int(1) }  }
+impl InspectTy for i16  { fn ty_of() -> Ty { Ty::Int(2) }  }
+impl InspectTy for i32  { fn ty_of() -> Ty { Ty::Int(4) }  }
+impl InspectTy for i64  { fn ty_of() -> Ty { Ty::Int(8) }  }
+impl<T: Sized> InspectTy for *const T {
+    fn ty_of() -> Ty {
+        Ty::Ptr(Pointer {
+            kind: RefKind::Shared,
+            align: core::mem::align_of::<T>(),
+        })
+    }
+}
+impl<T: Sized> InspectTy for *mut T {
+    fn ty_of() -> Ty {
+        Ty::Ptr(Pointer {
+            kind: RefKind::Unique,
+            align: core::mem::align_of::<T>(),
+        })
+    }
+}
 impl<T, const C: usize> InspectTy for [T; C]
     where T: InspectTy
 {
@@ -37,7 +57,7 @@ macro_rules! derive_ty {
         }
         impl $crate::derive::InspectTy for $name {
             fn ty_of() -> Ty {
-                let mut st = Struct::new();
+                let mut st = Struct::new(stringify!($name));
                 $(
                     st.add_field(false, <$ty as $crate::derive::InspectTy>::ty_of());
                 )*
@@ -58,7 +78,7 @@ macro_rules! derive_ty {
         }
         impl $crate::derive::InspectTy for $name {
             fn ty_of() -> Ty {
-                let mut en = Enum::new(core::mem::size_of::<$sz>() as u32);
+                let mut en = Enum::new(stringify!($name), core::mem::size_of::<$sz>() as u32);
                 let mut pos = 0;
                 $(
                     en.add_variant(pos, <$payload as $crate::derive::InspectTy>::ty_of());
@@ -82,7 +102,7 @@ macro_rules! derive_ty {
         }
         impl $crate::derive::InspectTy for $name {
             fn ty_of() -> Ty {
-                let mut un = Union::new();
+                let mut un = Union::new(stringify!($name));
                 $(
                     un.add_variant(false, <$payload as $crate::derive::InspectTy>::ty_of());
                 )*

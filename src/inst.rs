@@ -63,12 +63,225 @@ impl<B, R> Inst<B, R>
 
 pub type InstB = Inst<Box<[u8]>, Box<[(u8, u8)]>>;
 
-pub struct Program {
-    pub insts: Vec<InstB>,
+#[derive(Debug)]
+pub enum AcceptState {
+    Always,
+    NeverReadUninit,
+    NeverReadPrivate,
+    NeverWritePrivate,
+    NeverTagMismatch,
+    NeverOutOfRange,
+    MaybeCheckRange,
+}
+
+#[derive(Debug)]
+pub enum StepByte<'a> {
+    Uninit,
+    Bytes(bool, &'a [u8]),
+    ByteRanges(bool, &'a [(u8, u8)]),
+}
+
+fn ranges_contain(ranges: &[(u8, u8)], byte: u8) -> bool {
+    ranges.iter().any(|&(start, end)| byte >= start && byte <= end)
+}
+
+fn ranges_within(big: &[(u8, u8)], small: &[(u8, u8)]) -> bool {
+    small.iter().all(|(small_s, small_e)| {
+        big.iter().any(|(big_s, big_e)| {
+            big_s <= small_s && big_e >= small_e
+        })
+    })
+}
+
+impl<'a> StepByte<'a> {
+    pub fn accepts<'b>(&self, source: &StepByte<'b>) -> AcceptState {
+        use StepByte::*;
+        use AcceptState::*;
+        match (self, source) {
+            // Uninit bytes can accpet anything
+            (Uninit, _) => Always,
+            // Nothing can accept uninit
+            (_, Uninit) => NeverReadUninit,
+            // Cannot write private memory
+            (&ByteRanges(true, _), _) | (&Bytes(true, _), _) => {
+                NeverWritePrivate
+            }
+            // Cannot read private memory
+            (_, &ByteRanges(true, _)) | (_, &Bytes(true, _)) => {
+                NeverReadPrivate
+            }
+            // Constant tags must match
+            (Bytes(false, a), Bytes(false, b)) => {
+                if a != b {
+                    NeverTagMismatch
+                } else {
+                    Always
+                }
+            },
+            // CoverRange
+            (Bytes(false, bytes), ByteRanges(false, ranges)) => {
+                if ranges_contain(ranges, bytes[0]) {
+                    MaybeCheckRange
+                } else {
+                    NeverOutOfRange
+                }
+            },
+            (ByteRanges(false, ranges), Bytes(false, bytes)) => {
+                if ranges_contain(ranges, bytes[0]) {
+                    Always
+                } else {
+                    NeverOutOfRange
+                }
+            }
+            (ByteRanges(false, a), ByteRanges(false, b)) => {
+                if ranges_within(a, b) {
+                    Always
+                } else {
+                    MaybeCheckRange
+                }
+            },
+        }
+    }
+}
+
+pub enum LayoutStep<'a> {
+    Byte {
+        ip: InstPtr,
+        pos: usize,
+        byte: StepByte<'a>
+    },
+    Fork(InstPtr),
+    Join,
+}
+
+#[derive(Clone)]
+enum StackEntry {
+    Repeat { start: InstPtr, remaining: u32 },
+    Split { end: InstPtr },
+    Join,
+}
+
+pub struct Program<'a, B, R>
+    where B: AsRef<[u8]>,
+          R: AsRef<[(u8, u8)]>
+{
+    pub insts: &'a [Inst<B, R>],
+    pub ip: InstPtr,
+    pub pos: usize,
+    pending: &'a [u8],
+    stack: Vec<StackEntry>,
+}
+impl<'a, B, R> Program<'a, B, R>
+    where B: AsRef<[u8]>,
+          R: AsRef<[(u8, u8)]>
+{
+    pub fn new(insts: &'a[Inst<B,R>]) -> Self {
+        Self {
+            insts,
+            ip: 0,
+            pos: 0,
+            stack: Vec::new(),
+            pending: &[],
+        }
+    }
+    pub fn fork(&self, ip: InstPtr) -> Self {
+        let mut fork = Self {
+            insts: self.insts,
+            ip,
+            pos: self.pos,
+            stack: self.stack.clone(),
+            pending: self.pending,
+        };
+        fork.stack.push(StackEntry::Join);
+        fork
+    }
+    // pub fn split_byte(&mut self) -> Option<>
+    pub fn next_step(&mut self) -> Option<LayoutStep> {
+        while let Some(inst) = self.insts.get(self.ip as usize) {
+            let rv = match inst {
+                Inst::GroupEnd => {
+                    use StackEntry::*;
+                    let stack_entry = self.stack.pop()
+                        .expect("invalid state");
+                    match stack_entry {
+                        Repeat { start, remaining } => {
+                            if remaining > 1 {
+                                self.ip = start;
+                                self.stack.push(Repeat {
+                                    start,
+                                    remaining: remaining - 1,
+                                });
+                            }
+                            None
+                        }
+                        Split { end } => {
+                            self.ip = end;
+                            Some(LayoutStep::Join)
+                        }
+                        Join => Some(LayoutStep::Join),
+                    }
+                }
+                Inst::Uninit => {
+                    Some(LayoutStep::Byte {
+                        ip: self.ip,
+                        pos: self.pos,
+                        byte: StepByte::Uninit
+                    })
+                },
+                Inst::Repeat(ref repeat) => {
+                    use StackEntry::*;
+                    self.stack.push(Repeat {
+                        start: self.ip,
+                        remaining: repeat.count,
+                    });
+                    None
+                }
+                Inst::Split(ref split) => {
+                    use StackEntry::*;
+                    self.stack.push(Split { end: split.end });
+                    Some(LayoutStep::Fork(split.alternate))
+                }
+                Inst::Bytes(ref bytes) => {
+                    self.pending = bytes.bytes.as_ref();
+                    Some(LayoutStep::Byte {
+                        ip: self.ip,
+                        pos: self.pos,
+                        byte: StepByte::Bytes(bytes.private, bytes.bytes.as_ref())
+                    })
+                }
+                Inst::ByteRanges(ref ranges) => {
+                    Some(LayoutStep::Byte {
+                        ip: self.ip,
+                        pos: self.pos,
+                        byte: StepByte::ByteRanges(ranges.private, ranges.ranges.as_ref())
+                    })
+                }
+                Inst::Ref(ref _ref) => {
+                    println!("ref unimplemented");
+                    None
+                }
+                Inst::Pointer(ref _ptr) => {
+                    println!("ptr unimplemented");
+                    None
+                }
+            };
+            self.ip += 1;
+            if matches!(rv, Some(LayoutStep::Byte {..})) {
+                self.pos += 1;
+            }
+            if rv.is_some() {
+                return rv;
+            }
+        }
+        None
+    }
 }
 
 use core::fmt;
-impl fmt::Debug for Program {
+impl<'a, B, R> fmt::Debug for Program<'a, B, R>
+    where B: AsRef<[u8]>,
+          R: AsRef<[(u8, u8)]>
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "FiniteAutomaton {{")?;
         for (idx, inst) in self.insts.iter().enumerate() {
@@ -94,7 +307,7 @@ impl fmt::Debug for Program {
                     if bytes.private {
                         write!(f, "private, ")?;
                     }
-                    for (idx, &byte) in bytes.bytes.iter().enumerate() {
+                    for (idx, &byte) in bytes.bytes.as_ref().iter().enumerate() {
                         let sep = if idx != 0 { " " } else { "" };
                         write!(f, "{}{:02x}", sep, byte)?;
                     }
@@ -105,7 +318,7 @@ impl fmt::Debug for Program {
                     if ranges.private {
                         write!(f, "private, ")?;
                     }
-                    for (idx, &(start, end)) in ranges.ranges.iter().enumerate() {
+                    for (idx, &(start, end)) in ranges.ranges.as_ref().iter().enumerate() {
                         let sep = if idx != 0 { ", " } else { "" };
                         write!(f, "{}0x{:02x}-0x{:02x}", sep, start, end)?;
                     }

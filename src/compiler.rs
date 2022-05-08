@@ -36,6 +36,12 @@ impl Compiler {
                 self.repeat_byte(size, &[(0, 255)]);
                 self.layout = self.layout.extend(layout).unwrap().0;
             }
+            Ty::Ptr(ref _ptr) => {
+                unimplemented!();
+            }
+            Ty::Ref(ref _ptr) => {
+                unimplemented!();
+            }
             Ty::Array(ref array) => {
                 match array.count {
                     0 => {}
@@ -92,6 +98,7 @@ impl Compiler {
                 }
 
                 self.extend_enum_variant(e_def, last_variant);
+                self.insts.push(Inst::GroupEnd);
 
                 let ip = self.insts.len() as InstPtr;
                 for patch in patches {

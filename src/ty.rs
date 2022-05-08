@@ -4,6 +4,8 @@ pub enum Ty {
     Void,
     Bool,
     Int(u32),
+    Ptr(Pointer),
+    Ref(Reference),
     Struct(Struct),
     Array(Box<Array>),
     Enum(Enum),
@@ -17,13 +19,28 @@ impl Ty {
         }
     }
 }
+pub enum RefKind {
+    Shared,
+    Unique,
+}
+pub struct Pointer {
+    pub kind: RefKind,
+    pub align: usize,
+}
+pub struct Reference {
+    pub kind: RefKind,
+    pub size: usize,
+    pub align: usize,
+}
 pub struct Struct {
+    pub name: &'static str,
     pub layout: Layout,
     pub fields: Vec<Field>,
 }
 impl Struct {
-    pub fn new() -> Self {
+    pub fn new(name: &'static str) -> Self {
         Self {
+            name,
             layout: Layout::from_size_align(0, 1).unwrap(),
             fields: Vec::new(),
         }
@@ -42,15 +59,17 @@ pub struct Array {
     pub count: usize,
 }
 pub struct Enum {
+    pub name: &'static str,
     pub layout: Layout,
     pub tag_layout: Layout,
     pub payload_layout: Layout,
     pub variants: Vec<EnumVariant>,
 }
 impl Enum {
-    pub fn new(disc_size: u32) -> Self {
+    pub fn new(name: &'static str, disc_size: u32) -> Self {
         let tag_layout = layout_of(&Ty::Int(disc_size));
         Self {
+            name,
             layout: tag_layout,
             tag_layout,
             payload_layout: Layout::from_size_align(0, 1).unwrap(),
@@ -72,12 +91,14 @@ pub struct EnumVariant {
     pub payload: Ty,
 }
 pub struct Union {
+    pub name: &'static str,
     pub layout: Layout,
     pub variants: Vec<UnionVariant>,
 }
 impl Union {
-    pub fn new() -> Self {
+    pub fn new(name: &'static str) -> Self {
         Self {
+            name,
             layout: Layout::from_size_align(0, 1).unwrap(),
             variants: Vec::new(),
         }
@@ -112,6 +133,8 @@ pub fn layout_of(ty: &Ty) -> Layout {
             };
             Layout::from_size_align(size, align).unwrap()
         }
+        Ty::Ref(_) => unimplemented!(),
+        Ty::Ptr(_) => unimplemented!(),
         Ty::Array(ref arr) => {
             layout_of(&arr.element).repeat(arr.count).expect("array too big").0
         }
