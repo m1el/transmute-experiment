@@ -68,6 +68,24 @@ impl<'t> Printer<'t> {
             self.queue.push((ty, name));
         }
     }
+    fn write_c_fields(
+        &mut self, dst: &mut String, prefix: &str,
+        fields: impl Iterator<Item=&'t Ty>
+    ) -> Result<(), fmt::Error> {
+        for (idx, ty) in fields.enumerate() {
+            if let Ty::Array(ref arr) = ty {
+                let name = self.c_name_for(&arr.element);
+                writeln!(dst, "  {} {}{}[{}];",
+                    name, prefix, idx, arr.count)?;
+                self.maybe_push(&arr.element, name);
+            } else {
+                let name = self.c_name_for(&ty);
+                writeln!(dst, "  {} {}{};", name, prefix, idx)?;
+                self.maybe_push(&ty, name);
+            }
+        }
+        Ok(())
+    }
     pub fn print_c(&mut self, ty: &'t Ty) -> Result<String, fmt::Error> {
         let mut dst = Vec::new();
         self.pos = 0;
@@ -78,54 +96,24 @@ impl<'t> Printer<'t> {
                 Ty::Struct(ref st) => {
                     let mut tmp = String::new();
                     writeln!(tmp, "typedef struct S_{} {{", id)?;
-                    for (idx, field) in st.fields.iter().enumerate() {
-                        if let Ty::Array(ref arr) = field.ty {
-                            let name = self.c_name_for(&arr.element);
-                            writeln!(tmp, "  {} field{}[{}];",
-                                name, idx, arr.count)?;
-                            self.maybe_push(&field.ty, name);
-                        } else {
-                            let name = self.c_name_for(&field.ty);
-                            writeln!(tmp, "  {} field{};", name, idx)?;
-                            self.maybe_push(&field.ty, name);
-                        }
-                    }
+                    self.write_c_fields(&mut tmp, "field",
+                        st.fields.iter().map(|f| &f.ty))?;
                     writeln!(tmp, "}} {};", id)?;
                     dst.push(tmp);
                 }
                 Ty::Union(ref un) => {
                     let mut tmp = String::new();
                     writeln!(tmp, "typedef union U_{} {{", id)?;
-                    for (idx, field) in un.variants.iter().enumerate() {
-                        if let Ty::Array(ref arr) = field.ty {
-                            let name = self.c_name_for(&arr.element);
-                            writeln!(tmp, "  {} variant{}[{}];",
-                                name, idx, arr.count)?;
-                            self.maybe_push(&field.ty, name);
-                        } else {
-                            let name = self.c_name_for(&field.ty);
-                            writeln!(tmp, "  {} variant{};", name, idx)?;
-                            self.maybe_push(&field.ty, name);
-                        }
-                    }
+                    self.write_c_fields(&mut tmp, "variant",
+                        un.variants.iter().map(|v| &v.ty))?;
                     writeln!(tmp, "}} {};", id)?;
                     dst.push(tmp);
                 }
                 Ty::Enum(ref en) => {
                     let mut tmp = String::new();
                     writeln!(tmp, "typedef union U_{}_Payload {{", id)?;
-                    for (idx, variant) in en.variants.iter().enumerate() {
-                        if let Ty::Array(ref arr) = variant.payload {
-                            let name = self.c_name_for(&variant.payload);
-                            writeln!(tmp, "  {} field{}[{}];",
-                                name, idx, arr.count)?;
-                            self.maybe_push(&variant.payload, name);
-                        } else {
-                            let name = self.c_name_for(&variant.payload);
-                            writeln!(tmp, "  {} field{};", name, idx)?;
-                            self.maybe_push(&variant.payload, name);
-                        }
-                    }
+                    self.write_c_fields(&mut tmp, "variant",
+                        en.variants.iter().map(|v| &v.payload))?;
                     writeln!(tmp, "}} {}_Payload;", id)?;
                     writeln!(tmp, "typedef struct S_{} {{", id)?;
                     writeln!(tmp, "  u{} tag;", en.tag_layout.size() * 8)?;
@@ -137,8 +125,23 @@ impl<'t> Printer<'t> {
             }
         }
         let mut dst = dst.into_iter().rev().collect::<String>();
-        writeln!(dst, "{} value;", name)?;
+        writeln!(dst, "typedef {} Root;", name)?;
         Ok(dst)
+    }
+    fn write_rust_fields(
+        &mut self, dst: &mut String, prefix: &str,
+        fields: impl Iterator<Item=&'t Ty>
+    ) -> Result<(), fmt::Error> {
+        for (idx, ty) in fields.enumerate() {
+            let name = self.rust_name_for(&ty);
+            writeln!(dst, "  {}{}: {},", prefix, idx, name)?;
+            if let Ty::Array(ref arr) = ty {
+                let name = self.rust_name_for(&arr.element);
+                self.maybe_push(&arr.element, name);
+            }
+            self.maybe_push(&ty, name);
+        }
+        Ok(())
     }
     pub fn print_rust(&mut self, ty: &'t Ty) -> Result<String, fmt::Error> {
         let mut dst = String::new();
@@ -149,15 +152,8 @@ impl<'t> Printer<'t> {
             match ty {
                 Ty::Struct(ref st) => {
                     writeln!(dst, "#[repr(C)]\nstruct {} {{", id)?;
-                    for (idx, field) in st.fields.iter().enumerate() {
-                        let name = self.rust_name_for(&field.ty);
-                        writeln!(dst, "  field{}: {},", idx, name)?;
-                        if let Ty::Array(ref arr) = field.ty {
-                            let name = self.rust_name_for(&arr.element);
-                            self.maybe_push(&arr.element, name);
-                        }
-                        self.maybe_push(&field.ty, name);
-                    }
+                    self.write_rust_fields(&mut dst, "field",
+                        st.fields.iter().map(|f| &f.ty))?;
                     writeln!(dst, "}}")?;
                 }
                 Ty::Enum(ref en) => {
@@ -176,21 +172,14 @@ impl<'t> Printer<'t> {
                 }
                 Ty::Union(ref un) => {
                     writeln!(dst, "#[repr(C)]\nunion {} {{", id)?;
-                    for (idx, variant) in un.variants.iter().enumerate() {
-                        let name = self.rust_name_for(&variant.ty);
-                        writeln!(dst, "  variant{}: {},", idx, name)?;
-                        if let Ty::Array(ref arr) = variant.ty {
-                            let name = self.rust_name_for(&arr.element);
-                            self.maybe_push(&arr.element, name);
-                        }
-                        self.maybe_push(&variant.ty, name);
-                    }
+                    self.write_rust_fields(&mut dst, "variant",
+                        un.variants.iter().map(|v| &v.ty))?;
                     writeln!(dst, "}}")?;
                 }
                 _ => unimplemented!(),
             }
         }
-        writeln!(&mut dst, "let value: {};", name)?;
+        writeln!(&mut dst, "type Root = {};", name)?;
         Ok(dst)
     }
 }
