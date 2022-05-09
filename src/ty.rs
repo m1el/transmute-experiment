@@ -13,10 +13,7 @@ pub enum Ty {
 }
 impl Ty {
     pub fn needs_name(&self) -> bool {
-        match self {
-            Ty::Struct(_) | Ty::Enum(_) | Ty::Union(_) => true,
-            _ => false,
-        }
+        matches!(self, Ty::Struct(_) | Ty::Enum(_) | Ty::Union(_))
     }
 }
 pub enum RefKind {

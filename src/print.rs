@@ -83,9 +83,9 @@ impl<'t> Printer<'t> {
                     name, prefix, idx, arr.count)?;
                 self.maybe_push(&arr.element, name);
             } else {
-                let name = self.c_name_for(&ty);
+                let name = self.c_name_for(ty);
                 writeln!(dst, "  {} {}{};", name, prefix, idx)?;
-                self.maybe_push(&ty, name);
+                self.maybe_push(ty, name);
             }
         }
         Ok(())
@@ -137,13 +137,13 @@ impl<'t> Printer<'t> {
         fields: impl Iterator<Item=&'t Ty>
     ) -> Result<(), fmt::Error> {
         for (idx, ty) in fields.enumerate() {
-            let name = self.rust_name_for(&ty);
+            let name = self.rust_name_for(ty);
             writeln!(dst, "  {}{}: {},", prefix, idx, name)?;
             if let Ty::Array(ref arr) = ty {
                 let name = self.rust_name_for(&arr.element);
                 self.maybe_push(&arr.element, name);
             }
-            self.maybe_push(&ty, name);
+            self.maybe_push(ty, name);
         }
         Ok(())
     }

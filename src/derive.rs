@@ -32,6 +32,24 @@ impl<T: Sized> InspectTy for *mut T {
         })
     }
 }
+impl<T: Sized> InspectTy for &T {
+    fn ty_of() -> Ty {
+        Ty::Ref(Reference {
+            kind: RefKind::Shared,
+            size: core::mem::size_of::<T>(),
+            align: core::mem::align_of::<T>(),
+        })
+    }
+}
+impl<T: Sized> InspectTy for &mut T {
+    fn ty_of() -> Ty {
+        Ty::Ref(Reference {
+            kind: RefKind::Unique,
+            size: core::mem::size_of::<T>(),
+            align: core::mem::align_of::<T>(),
+        })
+    }
+}
 impl<T, const C: usize> InspectTy for [T; C]
     where T: InspectTy
 {

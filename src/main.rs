@@ -1,6 +1,5 @@
 #![feature(alloc_layout_extra)]
 #![feature(untagged_unions)]
-
 mod compiler;
 mod derive;
 mod inst;
@@ -9,8 +8,146 @@ mod ty;
 use print::Printer;
 use derive::{InspectTy, derive_ty};
 use crate::compiler::Compiler;
-use crate::inst::{Program, LayoutStep, StepByte};
+use crate::inst::{Program, StackEntry, LayoutStep, StepByte};
 use crate::ty::*;
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum ForkReason {
+    Dst,
+    Src,
+}
+
+struct Fork<'a, B, R>
+    where B: AsRef<[u8]>,
+          R: AsRef<[(u8, u8)]>
+{
+    dst: Program<'a, B, R>,
+    src: Program<'a, B, R>,
+    reason: ForkReason,
+}
+
+struct Execution<'a, B, R>
+    where B: AsRef<[u8]>,
+          R: AsRef<[(u8, u8)]>
+{
+    forks: Vec<Fork<'a, B, R>>,
+    dst: Program<'a, B, R>,
+    src: Program<'a, B, R>,
+    dst_stack: Vec<StackEntry>,
+    src_stack: Vec<StackEntry>,
+}
+impl<'a, B, R> Execution<'a, B, R>
+    where B: AsRef<[u8]>,
+          R: AsRef<[(u8, u8)]>
+{
+    fn new(dst: Program<'a, B, R>, src: Program<'a, B, R>) -> Self {
+        Self {
+            forks: Vec::new(),
+            dst,
+            src,
+            dst_stack: Vec::new(),
+            src_stack: Vec::new(),
+        }
+    }
+    fn pop_fork(&mut self, reason: ForkReason) -> Option<Fork<'a, B, R>> {
+        let last = self.forks.last()
+            .expect("Asked to join when there was no previous fork");
+        if last.reason == reason {
+            self.forks.pop()
+        } else {
+            None
+        }
+    }
+    fn check(&mut self) {
+        loop {
+            let have_src = match self.src.peek(&mut self.src_stack) {
+                None => {
+                    // emit Uninit forever
+                    true
+                }
+                Some(LayoutStep::Fork(next_src)) => {
+                    println!("fork src");
+                    self.src.next(&mut self.src_stack);
+                    self.forks.push(Fork {
+                        dst: self.dst.clone(),
+                        src: next_src,
+                        reason: ForkReason::Src,
+                    });
+                    continue;
+                }
+                Some(LayoutStep::Join) => {
+                    if let Some(fork) = self.pop_fork(ForkReason::Src) {
+                        self.src.next(&mut self.src_stack);
+                        // self.src_stack.push(StackEntry::Split { end: self.src.ip });
+                        self.dst = fork.dst;
+                        self.src = fork.src;
+                        println!("handle src join logic");
+                        continue;
+                    }
+                    false
+                }
+                Some(LayoutStep::Byte { .. }) => true
+            };
+
+            let have_dst = match self.dst.peek(&mut self.dst_stack) {
+                None => {
+                    if !self.forks.is_empty() {
+                        self.src.fast_forward(&mut self.src_stack);
+                        continue;
+                    }
+                    println!("always match");
+                    break;
+                }
+                Some(LayoutStep::Fork(next_dst)) => {
+                    println!("fork dst");
+                    self.dst.next(&mut self.dst_stack);
+                    self.forks.push(Fork {
+                        dst: next_dst,
+                        src: self.src.clone(),
+                        reason: ForkReason::Dst,
+                    });
+                    continue;
+                }
+                Some(LayoutStep::Join) => {
+                    if let Some(fork) = self.pop_fork(ForkReason::Dst) {
+                        self.src.next(&mut self.src_stack);
+                        // self.dst_stack.push(StackEntry::Split { end: self.dst.ip });
+                        self.dst = fork.dst;
+                        self.src = fork.src;
+                        println!("handle dst join logic");
+                        continue;
+                    }
+                    false
+                }
+                Some(LayoutStep::Byte { .. }) => true
+            };
+
+            if !have_src || !have_dst {
+                continue;
+            }
+
+            let (s_ip, byte_src) = match self.src.next(&mut self.src_stack) {
+                None => (!0, StepByte::Uninit),
+                Some(LayoutStep::Byte { ip, byte, .. }) => {
+                    (ip, byte)
+                }
+                _ => unreachable!("peek and next must match")
+            };
+            let (d_ip, byte_dst) = match self.dst.next(&mut self.src_stack) {
+                Some(LayoutStep::Byte { ip, byte, .. }) => (ip, byte),
+                _ => unreachable!("peek and next must match")
+            };
+
+            println!("{:?} [{},{}] ({:?} <- {:?})",
+                byte_dst.accepts(&byte_src),
+                d_ip, s_ip, byte_dst, byte_src
+            );
+            // println!("{:?} ({:?} -> {:?})",
+            //     byte_src.accepts(&byte_dst), byte_dst, byte_src
+            // );
+        }
+    }
+}
 
 #[allow(dead_code)]
 fn main() {
@@ -33,28 +170,36 @@ fn main() {
             b: u32,
             c: [u8; 4],
         });
+        derive_ty!(#[repr(C)] union Uni {
+            a: u32,
+            b: Baz,
+        });
+        derive_ty!(#[repr(C)] struct Foo { r: &'static u32 });
         derive_ty!(#[repr(C, u8)] enum Bar {
             A(u32),
             B(Baz),
         });
         let ty_bar = Bar::ty_of();
+        let mut printer = Printer::new();
+        println!("{}", printer.print_rust(&ty_bar).unwrap());
+        println!("{}", printer.print_c(&ty_bar).unwrap());
         let mut compiler = Compiler::new(Endian::Little);
         compiler.extend_from_ty(&ty_bar);
         println!("comp layout: {:?}", compiler.layout);
-        let prog_bar = Program::new(&compiler.insts);
+        let prog_bar = Program::new(&compiler.insts, "Bar");
         println!("program for bar: {:?}", prog_bar);
         // std::process::exit(0);
     }
-    derive_ty!(#[repr(C)] struct Foo {
-        fiedl0: u8,
-        fiedl1: u32,
-        field2: u8,
-    });
-    derive_ty!(#[repr(C)] struct Bar {
-        fiedl0: u16,
-        fiedl1: u32,
-        field2: u8,
-    });
+    // derive_ty!(#[repr(C)] struct Foo {
+    //     fiedl0: u8,
+    //     fiedl1: u32,
+    //     field2: u8,
+    // });
+    // derive_ty!(#[repr(C)] struct Bar {
+    //     fiedl0: u16,
+    //     fiedl1: u32,
+    //     field2: u8,
+    // });
     // println!("sizeof Foo: {}", core::mem::size_of::<Foo>());
     // println!("sizeof Bar: {}", core::mem::size_of::<Bar>());
     // union U {
@@ -64,6 +209,14 @@ fn main() {
     // safe_transmute::<Pb, Au>
     // safe_transmute<[u8; 16], U>([0; 16]) // goood
     // safe_transmute<U, [u8; 16]>(U { nothing: () }) // bad
+    derive_ty!(#[repr(C, u8)] enum Foo {
+        A(()),
+        B(())
+    });
+    derive_ty!(#[repr(C, u8)] enum Bar {
+        A(()),
+        B(()),
+    });
     let mut ty_a = Foo::ty_of();
     if let Ty::Struct(ref mut st) = ty_a {
         st.fields[0].private = false;
@@ -78,51 +231,28 @@ fn main() {
     let mut compiler = Compiler::new(endian);
     compiler.extend_from_ty(&ty_a);
     println!("comp layout: {:?}", compiler.layout);
-    let prog_foo = Program::new(&compiler.insts);
+    let prog_foo = Program::new(&compiler.insts, "foo");
     println!("representation of Foo: {:?}", prog_foo);
 
     let mut compiler = Compiler::new(endian);
     compiler.extend_from_ty(&ty_b);
     println!("comp layout: {:?}", compiler.layout);
-    let prog_bar = Program::new(&compiler.insts);
+    let prog_bar = Program::new(&compiler.insts, "bar");
     println!("representation of Bar: {:?}", prog_bar);
     if false {
        println!("{:?}", prog_bar);
     }
+    let mut execution = Execution::new(prog_foo, prog_bar);
+    execution.check();
     // trait CanTransmuteInto<&Bar> for &Foo {}
     // trait CanTransmuteInto<Bar> for Foo {}
-    let mut current = Some((prog_foo, prog_bar));
+    // 1) implement Rust complier in OCaml
+    // 2) once self-sufficient, implement Rust compiler in Rust
+    // verion 0.1 can't compile itself (built in OCaml),
+    // verion 0.2 can compile itself
+
+    /*
     let mut forks = vec![];
-    'outer: while let Some((mut prog_a, mut prog_b)) = current {
-        let byte_a;
-        match prog_a.next_step() {
-            Some(LayoutStep::Byte { byte, .. }) => {
-                byte_a = byte;
-            }
-            Some(LayoutStep::Fork(_)) => unimplemented!(),
-            Some(LayoutStep::Join) => unimplemented!(),
-            None => {
-                current = forks.pop();
-                continue 'outer;
-            },
-        }
-        let byte_b;
-        match prog_b.next_step() {
-            Some(LayoutStep::Byte { byte, .. }) => {
-                byte_b = byte;
-            }
-            Some(LayoutStep::Fork(_)) => unimplemented!(),
-            Some(LayoutStep::Join) => unimplemented!(),
-            None => {
-                byte_b = StepByte::Uninit;
-            },
-        }
-        println!("{:?} ({:?} <- {:?})",
-            byte_a.accepts(&byte_b), byte_a, byte_b
-        );
-        println!("{:?} ({:?} -> {:?})",
-            byte_b.accepts(&byte_a), byte_a, byte_b
-        );
-        current = Some((prog_a, prog_b));
-    }
+
+    */
 }

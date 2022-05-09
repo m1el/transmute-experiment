@@ -98,7 +98,6 @@ impl Compiler {
                 }
 
                 self.extend_enum_variant(e_def, last_variant);
-                self.insts.push(Inst::GroupEnd);
 
                 let ip = self.insts.len() as InstPtr;
                 for patch in patches {

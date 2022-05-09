@@ -1,3 +1,5 @@
+use core::fmt;
+
 use crate::ty::Endian;
 
 fn write_target_uint(endianness: Endian, target: &mut [u8], data: u128) {
@@ -27,6 +29,60 @@ pub enum Inst<B, R>
     ByteRanges(InstByteRanges<R>),
     Split(InstSplit),
     Repeat(InstRepeat),
+}
+
+impl<B, R> fmt::Debug for Inst<B, R>
+    where B: AsRef<[u8]>,
+          R: AsRef<[(u8, u8)]>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        use Inst::*;
+        match self {
+            GroupEnd => write!(f, "GroupEnd"),
+            Uninit => write!(f, "Uninit"),
+            Pointer(ref ptr) => {
+                write!(f, "Pointer(pointer_size={}, data_align={})",
+                    ptr.data_align, ptr.pointer_size)
+            }
+            Ref(ref d_ref) => {
+                let ref_type = match &d_ref.ref_type {
+                    RefKind::Shared => "Shared",
+                    RefKind::Unique => "Unique",
+                };
+                write!(f, "Ref(type={}, data_align={})",
+                    ref_type, d_ref.data_align)
+            }
+            Bytes(ref bytes) => {
+                write!(f, "Bytes(")?;
+                if bytes.private {
+                    write!(f, "private, ")?;
+                }
+                for (idx, &byte) in bytes.bytes.as_ref().iter().enumerate() {
+                    let sep = if idx != 0 { " " } else { "" };
+                    write!(f, "{}{:02x}", sep, byte)?;
+                }
+                write!(f, ")")
+            }
+            ByteRanges(ref ranges) => {
+                write!(f, "ByteRanges(")?;
+                if ranges.private {
+                    write!(f, "private, ")?;
+                }
+                for (idx, &(start, end)) in ranges.ranges.as_ref().iter().enumerate() {
+                    let sep = if idx != 0 { ", " } else { "" };
+                    write!(f, "{}0x{:02x}-0x{:02x}", sep, start, end)?;
+                }
+                write!(f, ")")
+            }
+            Split(ref split) => {
+                write!(f, "Split(alt={}, end={})",
+                    split.alternate, split.end)
+            }
+            Repeat(ref repeat) => {
+                write!(f, "Repeat({})", repeat.count)
+            }
+        }
+    }
 }
 
 // representation of unions:
@@ -74,7 +130,7 @@ pub enum AcceptState {
     MaybeCheckRange,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum StepByte<'a> {
     Uninit,
     Bytes(bool, &'a [u8]),
@@ -144,22 +200,48 @@ impl<'a> StepByte<'a> {
     }
 }
 
-pub enum LayoutStep<'a> {
+pub enum LayoutStep<'a, P> {
     Byte {
         ip: InstPtr,
         pos: usize,
         byte: StepByte<'a>
     },
-    Fork(InstPtr),
+    Fork(P),
     Join,
+}
+impl<'a, P> LayoutStep<'a, P> {
+    pub fn map_fork<F, D>(self, f: F) -> LayoutStep<'a, D>
+        where F: Fn(P) -> D,
+    {
+        match self {
+            LayoutStep::Byte { ip, pos, byte } =>
+                LayoutStep::Byte { ip, pos, byte },
+            LayoutStep::Fork(p) => LayoutStep::Fork(f(p)),
+            LayoutStep::Join => LayoutStep::Join
+        }
+    }
 }
 
-#[derive(Clone)]
-enum StackEntry {
+impl<'a, P> Clone for LayoutStep<'a, P>
+    where P: Copy
+{
+    fn clone(&self) -> Self {
+        match self {
+            &LayoutStep::Byte { ip, pos, byte } =>
+                LayoutStep::Byte { ip, pos, byte },
+            &LayoutStep::Fork(ip) => LayoutStep::Fork(ip),
+            LayoutStep::Join => LayoutStep::Join,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum StackEntry {
     Repeat { start: InstPtr, remaining: u32 },
     Split { end: InstPtr },
-    Join,
 }
+
+// pub type ProgramB<'a> = Program<'a, Box<[u8]>, Box<[(u8, u8)]>>;
 
 pub struct Program<'a, B, R>
     where B: AsRef<[u8]>,
@@ -168,46 +250,82 @@ pub struct Program<'a, B, R>
     pub insts: &'a [Inst<B, R>],
     pub ip: InstPtr,
     pub pos: usize,
-    pending: &'a [u8],
-    stack: Vec<StackEntry>,
+    name: &'static str,
+    current: Option<LayoutStep<'a, InstPtr>>,
 }
+
+impl<'a, B, R> Clone for Program<'a, B, R>
+    where B: AsRef<[u8]>,
+          R: AsRef<[(u8, u8)]>
+{
+    fn clone(&self) -> Self {
+        Self {
+            current: self.current.clone(),
+            ..*self
+        }
+    }
+}
+
 impl<'a, B, R> Program<'a, B, R>
     where B: AsRef<[u8]>,
           R: AsRef<[(u8, u8)]>
 {
-    pub fn new(insts: &'a[Inst<B,R>]) -> Self {
+    pub fn new(insts: &'a[Inst<B,R>], name: &'static str) -> Self {
         Self {
             insts,
             ip: 0,
             pos: 0,
-            stack: Vec::new(),
-            pending: &[],
+            name,
+            current: None,
         }
     }
-    pub fn fork(&self, ip: InstPtr) -> Self {
-        let mut fork = Self {
+    fn fork(&self, ip: InstPtr) -> Self {
+        Self {
             insts: self.insts,
             ip,
             pos: self.pos,
-            stack: self.stack.clone(),
-            pending: self.pending,
-        };
-        fork.stack.push(StackEntry::Join);
-        fork
+            name: self.name,
+            current: None,
+        }
+    }
+    pub fn fast_forward(&mut self, stack: &mut Vec<StackEntry>) {
+        assert!(!stack.is_empty(), "cannot fast-forward with empty stack");
+        let target = stack.len() - 1;
+        while stack.len() > target {
+            self.advance(stack);
+        }
+    }
+    pub fn peek(&mut self, stack: &mut Vec<StackEntry>) -> Option<LayoutStep<Self>> {
+        if self.current.is_none() {
+            self.advance(stack);
+        }
+        self.current.clone().map(|step| {
+            step.map_fork(|ip| self.fork(ip))
+        })
+    }
+    pub fn next(&mut self, stack: &mut Vec<StackEntry>) -> Option<LayoutStep<Self>> {
+        if self.current.is_none() {
+            self.advance(stack);
+        }
+        self.current.take().map(|step| {
+            step.map_fork(|ip| self.fork(ip))
+        })
     }
     // pub fn split_byte(&mut self) -> Option<>
-    pub fn next_step(&mut self) -> Option<LayoutStep> {
+    fn advance(&mut self, stack: &mut Vec<StackEntry>) {
         while let Some(inst) = self.insts.get(self.ip as usize) {
+            print!("{} ip={} inst={:?} ", self.name, self.ip, inst);
+            println!("stack={:?}", stack);
             let rv = match inst {
                 Inst::GroupEnd => {
                     use StackEntry::*;
-                    let stack_entry = self.stack.pop()
-                        .expect("invalid state");
+                    let stack_entry = stack.pop()
+                        .expect("invalid state: unmatched GroupEnd");
                     match stack_entry {
                         Repeat { start, remaining } => {
                             if remaining > 1 {
                                 self.ip = start;
-                                self.stack.push(Repeat {
+                                stack.push(Repeat {
                                     start,
                                     remaining: remaining - 1,
                                 });
@@ -218,7 +336,6 @@ impl<'a, B, R> Program<'a, B, R>
                             self.ip = end;
                             Some(LayoutStep::Join)
                         }
-                        Join => Some(LayoutStep::Join),
                     }
                 }
                 Inst::Uninit => {
@@ -229,20 +346,17 @@ impl<'a, B, R> Program<'a, B, R>
                     })
                 },
                 Inst::Repeat(ref repeat) => {
-                    use StackEntry::*;
-                    self.stack.push(Repeat {
+                    stack.push(StackEntry::Repeat {
                         start: self.ip,
                         remaining: repeat.count,
                     });
                     None
                 }
                 Inst::Split(ref split) => {
-                    use StackEntry::*;
-                    self.stack.push(Split { end: split.end });
+                    stack.push(StackEntry::Split { end: split.end });
                     Some(LayoutStep::Fork(split.alternate))
                 }
                 Inst::Bytes(ref bytes) => {
-                    self.pending = bytes.bytes.as_ref();
                     Some(LayoutStep::Byte {
                         ip: self.ip,
                         pos: self.pos,
@@ -269,15 +383,14 @@ impl<'a, B, R> Program<'a, B, R>
             if matches!(rv, Some(LayoutStep::Byte {..})) {
                 self.pos += 1;
             }
-            if rv.is_some() {
-                return rv;
+            self.current = rv;
+            if self.current.is_some() {
+                return;
             }
         }
-        None
     }
 }
 
-use core::fmt;
 impl<'a, B, R> fmt::Debug for Program<'a, B, R>
     where B: AsRef<[u8]>,
           R: AsRef<[(u8, u8)]>
@@ -285,53 +398,7 @@ impl<'a, B, R> fmt::Debug for Program<'a, B, R>
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "FiniteAutomaton {{")?;
         for (idx, inst) in self.insts.iter().enumerate() {
-            use Inst::*;
-            write!(f, "  {:03} ", idx)?;
-            match inst {
-                GroupEnd => { writeln!(f, "GroupEnd")?; },
-                Uninit => { writeln!(f, "Uninit")?; },
-                Pointer(ref ptr) => {
-                    writeln!(f, "Pointer(pointer_size={}, data_align={})",
-                        ptr.data_align, ptr.pointer_size)?;
-                }
-                Ref(ref d_ref) => {
-                    let ref_type = match &d_ref.ref_type {
-                        RefKind::Shared => "Shared",
-                        RefKind::Unique => "Unique",
-                    };
-                    writeln!(f, "Ref(type={}, data_align={})",
-                        ref_type, d_ref.data_align)?;
-                }
-                Bytes(ref bytes) => {
-                    write!(f, "Bytes(")?;
-                    if bytes.private {
-                        write!(f, "private, ")?;
-                    }
-                    for (idx, &byte) in bytes.bytes.as_ref().iter().enumerate() {
-                        let sep = if idx != 0 { " " } else { "" };
-                        write!(f, "{}{:02x}", sep, byte)?;
-                    }
-                    writeln!(f, ")")?;
-                }
-                ByteRanges(ref ranges) => {
-                    write!(f, "ByteRanges(")?;
-                    if ranges.private {
-                        write!(f, "private, ")?;
-                    }
-                    for (idx, &(start, end)) in ranges.ranges.as_ref().iter().enumerate() {
-                        let sep = if idx != 0 { ", " } else { "" };
-                        write!(f, "{}0x{:02x}-0x{:02x}", sep, start, end)?;
-                    }
-                    writeln!(f, ")")?;
-                }
-                Split(ref split) => {
-                    writeln!(f, "Split(alt={}, end={})",
-                        split.alternate, split.end)?;
-                }
-                Repeat(ref repeat) => {
-                    writeln!(f, "Repeat({})", repeat.count)?;
-                }
-            };
+            writeln!(f, "  {:03} {:?}", idx, inst)?;
         }
         writeln!(f, "}}")?;
         Ok(())
