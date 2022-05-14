@@ -8,7 +8,7 @@ mod ty;
 use print::Printer;
 use derive::{InspectTy, derive_ty};
 use crate::compiler::Compiler;
-use crate::inst::{Program, StackEntry, LayoutStep, StepByte};
+use crate::inst::{Program, LayoutStep, StepByte};
 use crate::ty::*;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -17,39 +17,26 @@ enum ForkReason {
     Src,
 }
 
-struct Fork<'a, B, R>
-    where B: AsRef<[u8]>,
-          R: AsRef<[(u8, u8)]>
-{
-    dst: Program<'a, B, R>,
-    src: Program<'a, B, R>,
+struct Fork<'a> {
+    dst: Program<'a>,
+    src: Program<'a>,
     reason: ForkReason,
 }
 
-struct Execution<'a, B, R>
-    where B: AsRef<[u8]>,
-          R: AsRef<[(u8, u8)]>
-{
-    forks: Vec<Fork<'a, B, R>>,
-    dst: Program<'a, B, R>,
-    src: Program<'a, B, R>,
-    dst_stack: Vec<StackEntry>,
-    src_stack: Vec<StackEntry>,
+struct Execution<'a> {
+    forks: Vec<Fork<'a>>,
+    dst: Program<'a>,
+    src: Program<'a>,
 }
-impl<'a, B, R> Execution<'a, B, R>
-    where B: AsRef<[u8]>,
-          R: AsRef<[(u8, u8)]>
-{
-    fn new(dst: Program<'a, B, R>, src: Program<'a, B, R>) -> Self {
+impl<'a> Execution<'a> {
+    fn new(dst: Program<'a>, src: Program<'a>) -> Self {
         Self {
             forks: Vec::new(),
             dst,
             src,
-            dst_stack: Vec::new(),
-            src_stack: Vec::new(),
         }
     }
-    fn pop_fork(&mut self, reason: ForkReason) -> Option<Fork<'a, B, R>> {
+    fn pop_fork(&mut self, reason: ForkReason) -> Option<Fork<'a>> {
         let last = self.forks.last()
             .expect("Asked to join when there was no previous fork");
         if last.reason == reason {
@@ -60,80 +47,63 @@ impl<'a, B, R> Execution<'a, B, R>
     }
     fn check(&mut self) {
         loop {
-            let have_src = match self.src.peek(&mut self.src_stack) {
-                None => {
-                    // emit Uninit forever
-                    true
-                }
-                Some(LayoutStep::Fork(next_src)) => {
-                    println!("fork src");
-                    self.src.next(&mut self.src_stack);
-                    self.forks.push(Fork {
-                        dst: self.dst.clone(),
-                        src: next_src,
-                        reason: ForkReason::Src,
-                    });
+            if let Some(next_src) = self.src.next_fork() {
+                println!("fork src");
+                self.src.next();
+                self.forks.push(Fork {
+                    dst: self.dst.clone(),
+                    src: next_src,
+                    reason: ForkReason::Src,
+                });
+                continue;
+            }
+            if let Some(next_dst) = self.dst.next_fork() {
+                println!("fork dst");
+                self.dst.next();
+                self.forks.push(Fork {
+                    dst: next_dst,
+                    src: self.src.clone(),
+                    reason: ForkReason::Dst,
+                });
+                continue;
+            }
+            if let Some(last) = self.dst.next_join() {
+                if last {
+                    println!("join dst last");
                     continue;
                 }
-                Some(LayoutStep::Join) => {
-                    if let Some(fork) = self.pop_fork(ForkReason::Src) {
-                        self.src.next(&mut self.src_stack);
-                        // self.src_stack.push(StackEntry::Split { end: self.src.ip });
-                        self.dst = fork.dst;
-                        self.src = fork.src;
-                        println!("handle src join logic");
-                        continue;
-                    }
-                    false
+                if let Some(fork) = self.pop_fork(ForkReason::Dst) {
+                    self.dst = fork.dst;
+                    self.src = fork.src;
+                    println!("join dst");
                 }
-                Some(LayoutStep::Byte { .. }) => true
-            };
-
-            let have_dst = match self.dst.peek(&mut self.dst_stack) {
-                None => {
-                    if !self.forks.is_empty() {
-                        self.src.fast_forward(&mut self.src_stack);
-                        continue;
-                    }
-                    println!("always match");
-                    break;
-                }
-                Some(LayoutStep::Fork(next_dst)) => {
-                    println!("fork dst");
-                    self.dst.next(&mut self.dst_stack);
-                    self.forks.push(Fork {
-                        dst: next_dst,
-                        src: self.src.clone(),
-                        reason: ForkReason::Dst,
-                    });
+                continue;
+            }
+            if let Some(last) = self.src.next_join() {
+                if last {
+                    println!("join src last");
                     continue;
                 }
-                Some(LayoutStep::Join) => {
-                    if let Some(fork) = self.pop_fork(ForkReason::Dst) {
-                        self.src.next(&mut self.src_stack);
-                        // self.dst_stack.push(StackEntry::Split { end: self.dst.ip });
-                        self.dst = fork.dst;
-                        self.src = fork.src;
-                        println!("handle dst join logic");
-                        continue;
-                    }
-                    false
+                if let Some(fork) = self.pop_fork(ForkReason::Src) {
+                    self.dst = fork.dst;
+                    self.src = fork.src;
+                    println!("join src");
                 }
-                Some(LayoutStep::Byte { .. }) => true
-            };
-
-            if !have_src || !have_dst {
                 continue;
             }
 
-            let (s_ip, byte_src) = match self.src.next(&mut self.src_stack) {
+            let (s_ip, byte_src) = match self.src.next() {
                 None => (!0, StepByte::Uninit),
                 Some(LayoutStep::Byte { ip, byte, .. }) => {
                     (ip, byte)
                 }
                 _ => unreachable!("peek and next must match")
             };
-            let (d_ip, byte_dst) = match self.dst.next(&mut self.src_stack) {
+            let (d_ip, byte_dst) = match self.dst.next() {
+                None => {
+                    println!("always match");
+                    break;
+                }
                 Some(LayoutStep::Byte { ip, byte, .. }) => (ip, byte),
                 _ => unreachable!("peek and next must match")
             };
@@ -209,39 +179,37 @@ fn main() {
     // safe_transmute::<Pb, Au>
     // safe_transmute<[u8; 16], U>([0; 16]) // goood
     // safe_transmute<U, [u8; 16]>(U { nothing: () }) // bad
-    derive_ty!(#[repr(C, u8)] enum Foo {
-        A(()),
-        B(())
+    derive_ty!(#[repr(C, u8)] enum Enum {
+        A(bool),
+        B(bool)
     });
-    derive_ty!(#[repr(C, u8)] enum Bar {
-        A(()),
-        B(()),
+    derive_ty!(#[repr(C)] struct Struct0 {
+        a: bool,
+        b: Enum,
     });
-    let mut ty_a = Foo::ty_of();
-    if let Ty::Struct(ref mut st) = ty_a {
-        st.fields[0].private = false;
-    }
-    let ty_b = Bar::ty_of();
+    derive_ty!(#[repr(C)] struct Struct1 {
+        b: Enum,
+        a: bool,
+    });
+    let ty_a = Struct0::ty_of();
+    let ty_b = Struct1::ty_of();
     // let mut printer = Printer::new();
     // println!("{}", printer.print_rust(&ty_a).unwrap());
-    let mut printer = Printer::new();
-    println!("{}", printer.print_rust(&ty_a).unwrap());
-    println!("{}", printer.print_rust(&ty_b).unwrap());
+    // let mut printer = Printer::new();
+    // println!("{}", printer.print_rust(&ty_a).unwrap());
+    // println!("{}", printer.print_rust(&ty_b).unwrap());
     let endian = if true { Endian::Little } else { Endian::Big };
     let mut compiler = Compiler::new(endian);
     compiler.extend_from_ty(&ty_a);
-    println!("comp layout: {:?}", compiler.layout);
+    // println!("comp layout: {:?}", compiler.layout);
     let prog_foo = Program::new(&compiler.insts, "foo");
-    println!("representation of Foo: {:?}", prog_foo);
+    // println!("representation of Foo: {:?}", prog_foo);
 
     let mut compiler = Compiler::new(endian);
     compiler.extend_from_ty(&ty_b);
-    println!("comp layout: {:?}", compiler.layout);
+    // println!("comp layout: {:?}", compiler.layout);
     let prog_bar = Program::new(&compiler.insts, "bar");
-    println!("representation of Bar: {:?}", prog_bar);
-    if false {
-       println!("{:?}", prog_bar);
-    }
+    // println!("representation of Bar: {:?}", prog_bar);
     let mut execution = Execution::new(prog_foo, prog_bar);
     execution.check();
     // trait CanTransmuteInto<&Bar> for &Foo {}

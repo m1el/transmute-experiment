@@ -14,31 +14,24 @@ fn write_target_uint(endianness: Endian, target: &mut [u8], data: u128) {
 
 pub type InstPtr = u32;
 
-pub enum Inst<B, R>
-    where B: AsRef<[u8]>,
-          R: AsRef<[(u8, u8)]>
-{
-    GroupEnd,
+pub enum Inst {
     Uninit,
     // TODO: implement references and pointers
     #[allow(dead_code)]
     Pointer(InstrPointer),
     #[allow(dead_code)]
     Ref(InstrRef),
-    Bytes(InstBytes<B>),
-    ByteRanges(InstByteRanges<R>),
+    Byte(InstByte),
+    ByteRange(InstByteRange),
     Split(InstSplit),
-    Repeat(InstRepeat),
+    JoinLast,
+    JoinGoto(InstPtr),
 }
 
-impl<B, R> fmt::Debug for Inst<B, R>
-    where B: AsRef<[u8]>,
-          R: AsRef<[(u8, u8)]>
-{
+impl fmt::Debug for Inst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         use Inst::*;
         match self {
-            GroupEnd => write!(f, "GroupEnd"),
             Uninit => write!(f, "Uninit"),
             Pointer(ref ptr) => {
                 write!(f, "Pointer(pointer_size={}, data_align={})",
@@ -52,34 +45,26 @@ impl<B, R> fmt::Debug for Inst<B, R>
                 write!(f, "Ref(type={}, data_align={})",
                     ref_type, d_ref.data_align)
             }
-            Bytes(ref bytes) => {
-                write!(f, "Bytes(")?;
-                if bytes.private {
+            Byte(ref byte) => {
+                write!(f, "Byte(")?;
+                if byte.private {
                     write!(f, "private, ")?;
                 }
-                for (idx, &byte) in bytes.bytes.as_ref().iter().enumerate() {
-                    let sep = if idx != 0 { " " } else { "" };
-                    write!(f, "{}{:02x}", sep, byte)?;
-                }
-                write!(f, ")")
+                write!(f, "{:02x})", byte.byte)
             }
-            ByteRanges(ref ranges) => {
-                write!(f, "ByteRanges(")?;
-                if ranges.private {
+            ByteRange(ref range) => {
+                write!(f, "ByteRange(")?;
+                if range.private {
                     write!(f, "private, ")?;
                 }
-                for (idx, &(start, end)) in ranges.ranges.as_ref().iter().enumerate() {
-                    let sep = if idx != 0 { ", " } else { "" };
-                    write!(f, "{}0x{:02x}-0x{:02x}", sep, start, end)?;
-                }
-                write!(f, ")")
+                write!(f, "0x{:02x}-0x{:02x})", range.range.0, range.range.1)
             }
             Split(ref split) => {
-                write!(f, "Split(alt={}, end={})",
-                    split.alternate, split.end)
+                write!(f, "Split(alt={})", split.alternate)
             }
-            Repeat(ref repeat) => {
-                write!(f, "Repeat({})", repeat.count)
+            JoinLast => write!(f, "JoinLast"),
+            JoinGoto(ref addr) => {
+                write!(f, "JoinGoto({})", addr)
             }
         }
     }
@@ -89,15 +74,14 @@ impl<B, R> fmt::Debug for Inst<B, R>
 // split (labelb, end) aaaaaaaa (GroupEnd) bbbbbbbbbbbbb
 //                                        ^ labelb      ^ end
 
-impl<B, R> Inst<B, R>
-    where B: AsRef<[u8]>,
-          R: AsRef<[(u8, u8)]>
-{
+impl Inst {
     pub fn new_invalid_split() -> Self {
         Inst::Split(InstSplit {
-            alternate: u32::MAX,
-            end: u32::MAX,
+            alternate: InstPtr::MAX,
         })
+    }
+    pub fn new_invalid_goto() -> Self {
+        Inst::JoinGoto(InstPtr::MAX)
     }
     pub fn patch_split(&mut self, alternate: InstPtr) {
         match self {
@@ -107,17 +91,16 @@ impl<B, R> Inst<B, R>
             _ => panic!("invalid use of patch_split")
         }
     }
-    pub fn patch_split_end(&mut self, end: InstPtr) {
+    pub fn patch_goto(&mut self, addr: InstPtr) {
         match self {
-            Inst::Split(ref mut split) => {
-                split.end = end;
+            Inst::JoinGoto(ref mut goto) => {
+                *goto = addr
             }
-            _ => panic!("invalid use of patch_split")
+            _ => panic!("invalid use of patch_goto")
         }
     }
 }
 
-pub type InstB = Inst<Box<[u8]>, Box<[(u8, u8)]>>;
 
 #[derive(Debug)]
 pub enum AcceptState {
@@ -131,26 +114,22 @@ pub enum AcceptState {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum StepByte<'a> {
+pub enum StepByte {
     Uninit,
-    Bytes(bool, &'a [u8]),
-    ByteRanges(bool, &'a [(u8, u8)]),
+    Byte(bool, u8),
+    ByteRange(bool, (u8, u8)),
 }
 
-fn ranges_contain(ranges: &[(u8, u8)], byte: u8) -> bool {
-    ranges.iter().any(|&(start, end)| byte >= start && byte <= end)
+fn range_contain((lo, hi): (u8, u8), byte: u8) -> bool {
+    byte >= lo && byte <= hi
 }
 
-fn ranges_within(big: &[(u8, u8)], small: &[(u8, u8)]) -> bool {
-    small.iter().all(|(small_s, small_e)| {
-        big.iter().any(|(big_s, big_e)| {
-            big_s <= small_s && big_e >= small_e
-        })
-    })
+fn ranges_within(big: (u8, u8), small: (u8, u8)) -> bool {
+    big.0 <= small.0 && big.1 >= small.1
 }
 
-impl<'a> StepByte<'a> {
-    pub fn accepts<'b>(&self, source: &StepByte<'b>) -> AcceptState {
+impl StepByte {
+    pub fn accepts(&self, source: &StepByte) -> AcceptState {
         use StepByte::*;
         use AcceptState::*;
         match (self, source) {
@@ -159,15 +138,15 @@ impl<'a> StepByte<'a> {
             // Nothing can accept uninit
             (_, Uninit) => NeverReadUninit,
             // Cannot write private memory
-            (&ByteRanges(true, _), _) | (&Bytes(true, _), _) => {
+            (&ByteRange(true, _), _) | (&Byte(true, _), _) => {
                 NeverWritePrivate
             }
             // Cannot read private memory
-            (_, &ByteRanges(true, _)) | (_, &Bytes(true, _)) => {
+            (_, &ByteRange(true, _)) | (_, &Byte(true, _)) => {
                 NeverReadPrivate
             }
             // Constant tags must match
-            (Bytes(false, a), Bytes(false, b)) => {
+            (Byte(false, a), Byte(false, b)) => {
                 if a != b {
                     NeverTagMismatch
                 } else {
@@ -175,22 +154,22 @@ impl<'a> StepByte<'a> {
                 }
             },
             // CoverRange
-            (Bytes(false, bytes), ByteRanges(false, ranges)) => {
-                if ranges_contain(ranges, bytes[0]) {
+            (Byte(false, byte), ByteRange(false, range)) => {
+                if range_contain(*range, *byte) {
                     MaybeCheckRange
                 } else {
                     NeverOutOfRange
                 }
             },
-            (ByteRanges(false, ranges), Bytes(false, bytes)) => {
-                if ranges_contain(ranges, bytes[0]) {
+            (ByteRange(false, range), Byte(false, byte)) => {
+                if range_contain(*range, *byte) {
                     Always
                 } else {
                     NeverOutOfRange
                 }
             }
-            (ByteRanges(false, a), ByteRanges(false, b)) => {
-                if ranges_within(a, b) {
+            (ByteRange(false, a), ByteRange(false, b)) => {
+                if ranges_within(*a, *b) {
                     Always
                 } else {
                     MaybeCheckRange
@@ -200,29 +179,29 @@ impl<'a> StepByte<'a> {
     }
 }
 
-pub enum LayoutStep<'a, P> {
+pub enum LayoutStep<P> {
     Byte {
         ip: InstPtr,
         pos: usize,
-        byte: StepByte<'a>
+        byte: StepByte
     },
     Fork(P),
-    Join,
+    Join(bool),
 }
-impl<'a, P> LayoutStep<'a, P> {
-    pub fn map_fork<F, D>(self, f: F) -> LayoutStep<'a, D>
+impl<P> LayoutStep<P> {
+    pub fn map_fork<F, D>(self, f: F) -> LayoutStep<D>
         where F: Fn(P) -> D,
     {
         match self {
             LayoutStep::Byte { ip, pos, byte } =>
                 LayoutStep::Byte { ip, pos, byte },
             LayoutStep::Fork(p) => LayoutStep::Fork(f(p)),
-            LayoutStep::Join => LayoutStep::Join
+            LayoutStep::Join(l) => LayoutStep::Join(l),
         }
     }
 }
 
-impl<'a, P> Clone for LayoutStep<'a, P>
+impl<P> Clone for LayoutStep<P>
     where P: Copy
 {
     fn clone(&self) -> Self {
@@ -230,34 +209,23 @@ impl<'a, P> Clone for LayoutStep<'a, P>
             &LayoutStep::Byte { ip, pos, byte } =>
                 LayoutStep::Byte { ip, pos, byte },
             &LayoutStep::Fork(ip) => LayoutStep::Fork(ip),
-            LayoutStep::Join => LayoutStep::Join,
+            &LayoutStep::Join(l) => LayoutStep::Join(l),
         }
     }
 }
 
-#[derive(Debug)]
-pub enum StackEntry {
-    Repeat { start: InstPtr, remaining: u32 },
-    Split { end: InstPtr },
-}
 
 // pub type ProgramB<'a> = Program<'a, Box<[u8]>, Box<[(u8, u8)]>>;
 
-pub struct Program<'a, B, R>
-    where B: AsRef<[u8]>,
-          R: AsRef<[(u8, u8)]>
-{
-    pub insts: &'a [Inst<B, R>],
+pub struct Program<'a> {
+    pub insts: &'a [Inst],
     pub ip: InstPtr,
     pub pos: usize,
     name: &'static str,
-    current: Option<LayoutStep<'a, InstPtr>>,
+    current: Option<LayoutStep<InstPtr>>,
 }
 
-impl<'a, B, R> Clone for Program<'a, B, R>
-    where B: AsRef<[u8]>,
-          R: AsRef<[(u8, u8)]>
-{
+impl<'a> Clone for Program<'a> {
     fn clone(&self) -> Self {
         Self {
             current: self.current.clone(),
@@ -266,11 +234,8 @@ impl<'a, B, R> Clone for Program<'a, B, R>
     }
 }
 
-impl<'a, B, R> Program<'a, B, R>
-    where B: AsRef<[u8]>,
-          R: AsRef<[(u8, u8)]>
-{
-    pub fn new(insts: &'a[Inst<B,R>], name: &'static str) -> Self {
+impl<'a> Program<'a> {
+    pub fn new(insts: &'a[Inst], name: &'static str) -> Self {
         Self {
             insts,
             ip: 0,
@@ -288,56 +253,55 @@ impl<'a, B, R> Program<'a, B, R>
             current: None,
         }
     }
-    pub fn fast_forward(&mut self, stack: &mut Vec<StackEntry>) {
-        assert!(!stack.is_empty(), "cannot fast-forward with empty stack");
-        let target = stack.len() - 1;
-        while stack.len() > target {
-            self.advance(stack);
+    pub fn next_fork(&mut self) -> Option<Self> {
+        if self.current.is_none() {
+            self.advance();
+        }
+        match &self.current {
+            &Some(LayoutStep::Fork(ip)) => {
+                self.current = None;
+                Some(self.fork(ip))
+            }
+            _ => None
         }
     }
-    pub fn peek(&mut self, stack: &mut Vec<StackEntry>) -> Option<LayoutStep<Self>> {
+    pub fn next_join(&mut self) -> Option<bool> {
         if self.current.is_none() {
-            self.advance(stack);
+            self.advance();
         }
-        self.current.clone().map(|step| {
-            step.map_fork(|ip| self.fork(ip))
-        })
+        match &self.current {
+            &Some(LayoutStep::Join(last)) => {
+                self.current = None;
+                Some(last)
+            }
+            _ => None
+        }
     }
-    pub fn next(&mut self, stack: &mut Vec<StackEntry>) -> Option<LayoutStep<Self>> {
+    // pub fn peek(&mut self, stack: &mut Vec<StackEntry>) -> Option<LayoutStep<Self>> {
+    //     if self.current.is_none() {
+    //         self.advance(stack);
+    //     }
+    //     self.current.clone().map(|step| {
+    //         step.map_fork(|ip| self.fork(ip))
+    //     })
+    // }
+    pub fn next(&mut self) -> Option<LayoutStep<Self>> {
         if self.current.is_none() {
-            self.advance(stack);
+            self.advance();
         }
         self.current.take().map(|step| {
             step.map_fork(|ip| self.fork(ip))
         })
     }
+    //  0(2 3|5 6)
+    // (1 2|4 5)7
     // pub fn split_byte(&mut self) -> Option<>
-    fn advance(&mut self, stack: &mut Vec<StackEntry>) {
+    fn advance(&mut self) {
         while let Some(inst) = self.insts.get(self.ip as usize) {
-            print!("{} ip={} inst={:?} ", self.name, self.ip, inst);
-            println!("stack={:?}", stack);
+            // print!("{} ip={} inst={:?} ", self.name, self.ip, inst);
+            // println!("stack={:?}", self.stack);
             let rv = match inst {
-                Inst::GroupEnd => {
-                    use StackEntry::*;
-                    let stack_entry = stack.pop()
-                        .expect("invalid state: unmatched GroupEnd");
-                    match stack_entry {
-                        Repeat { start, remaining } => {
-                            if remaining > 1 {
-                                self.ip = start;
-                                stack.push(Repeat {
-                                    start,
-                                    remaining: remaining - 1,
-                                });
-                            }
-                            None
-                        }
-                        Split { end } => {
-                            self.ip = end;
-                            Some(LayoutStep::Join)
-                        }
-                    }
-                }
+
                 Inst::Uninit => {
                     Some(LayoutStep::Byte {
                         ip: self.ip,
@@ -345,29 +309,21 @@ impl<'a, B, R> Program<'a, B, R>
                         byte: StepByte::Uninit
                     })
                 },
-                Inst::Repeat(ref repeat) => {
-                    stack.push(StackEntry::Repeat {
-                        start: self.ip,
-                        remaining: repeat.count,
-                    });
-                    None
-                }
                 Inst::Split(ref split) => {
-                    stack.push(StackEntry::Split { end: split.end });
                     Some(LayoutStep::Fork(split.alternate))
                 }
-                Inst::Bytes(ref bytes) => {
+                Inst::Byte(ref byte) => {
                     Some(LayoutStep::Byte {
                         ip: self.ip,
                         pos: self.pos,
-                        byte: StepByte::Bytes(bytes.private, bytes.bytes.as_ref())
+                        byte: StepByte::Byte(byte.private, byte.byte)
                     })
                 }
-                Inst::ByteRanges(ref ranges) => {
+                Inst::ByteRange(ref range) => {
                     Some(LayoutStep::Byte {
                         ip: self.ip,
                         pos: self.pos,
-                        byte: StepByte::ByteRanges(ranges.private, ranges.ranges.as_ref())
+                        byte: StepByte::ByteRange(range.private, range.range)
                     })
                 }
                 Inst::Ref(ref _ref) => {
@@ -377,6 +333,13 @@ impl<'a, B, R> Program<'a, B, R>
                 Inst::Pointer(ref _ptr) => {
                     println!("ptr unimplemented");
                     None
+                }
+                Inst::JoinLast => {
+                    Some(LayoutStep::Join(true))
+                }
+                &Inst::JoinGoto(addr) => {
+                    self.ip = addr;
+                    Some(LayoutStep::Join(false))
                 }
             };
             self.ip += 1;
@@ -391,10 +354,7 @@ impl<'a, B, R> Program<'a, B, R>
     }
 }
 
-impl<'a, B, R> fmt::Debug for Program<'a, B, R>
-    where B: AsRef<[u8]>,
-          R: AsRef<[(u8, u8)]>
-{
+impl<'a> fmt::Debug for Program<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "FiniteAutomaton {{")?;
         for (idx, inst) in self.insts.iter().enumerate() {
@@ -422,47 +382,48 @@ pub struct InstrRef {
     pub pointer_size: u32,
     pub data_align: u32,
 }
-
-pub struct InstBytes<B>
-    where B: AsRef<[u8]>
-{
-    pub private: bool,
-    pub bytes: B,
-}
-impl<B> InstBytes<B>
-    where B: AsRef<[u8]>
-{
-    pub fn with_private(mut self, private: bool) -> Self {
-        self.private = private;
-        self
-    }
-}
-
-impl<B> InstBytes<B>
-    where B: From<Vec<u8>> + AsRef<[u8]>
-{
-    pub fn for_literal(endian: Endian, size: usize, value: u128) -> impl Iterator<Item=Self> {
-        let mut data = [0_u8; 16];
-        write_target_uint(endian, &mut data[..size], value);
-        core::iter::once(InstBytes {
-            private: false,
-            bytes: data[..size].to_vec().into(),
-        }).chain(None)
-    }
-}
-
-pub struct InstByteRanges<R>
-    where R: AsRef<[(u8, u8)]>
-{
-    pub private: bool,
-    pub ranges: R,
-}
-
-pub struct InstSplit {
+pub struct InstSplit {     
     pub alternate: InstPtr,
-    pub end: InstPtr,
 }
 
-pub struct InstRepeat {
-    pub count: u32,
+pub struct InstByte {
+    pub private: bool,
+    pub byte: u8,
+}
+
+impl InstByte {
+    pub fn for_literal(
+        endian: Endian, size: usize,
+        value: u128, private: bool)
+    -> impl Iterator<Item=Inst> {
+        let mut data = [0_u8; 16];
+        let start = data.len() - size;
+        write_target_uint(endian, &mut data[start..], value);
+        LiteralBytes {
+            data,
+            private,
+            pos: start,
+        }
+    }
+}
+
+struct LiteralBytes {
+    data: [u8; 16],
+    private: bool,
+    pos: usize,
+}
+
+impl Iterator for LiteralBytes {
+    type Item=Inst;
+    fn next(&mut self) -> Option<Self::Item> {
+        let byte = *self.data.get(self.pos)?;
+        let private = self.private;
+        self.pos += 1;
+        Some(Inst::Byte(InstByte { private, byte }))
+    }
+}
+
+pub struct InstByteRange {
+    pub private: bool,
+    pub range: (u8, u8),
 }

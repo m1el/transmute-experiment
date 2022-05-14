@@ -75,7 +75,7 @@ macro_rules! derive_ty {
         }
         impl $crate::derive::InspectTy for $name {
             fn ty_of() -> Ty {
-                let mut st = Struct::new(stringify!($name));
+                let mut st = $crate::ty::Struct::new(stringify!($name));
                 $(
                     st.add_field(false, <$ty as $crate::derive::InspectTy>::ty_of());
                 )*
@@ -96,7 +96,7 @@ macro_rules! derive_ty {
         }
         impl $crate::derive::InspectTy for $name {
             fn ty_of() -> Ty {
-                let mut en = Enum::new(stringify!($name), core::mem::size_of::<$sz>() as u32);
+                let mut en = $crate::ty::Enum::new(stringify!($name), core::mem::size_of::<$sz>() as u32);
                 let mut pos = 0;
                 $(
                     en.add_variant(pos, <$payload as $crate::derive::InspectTy>::ty_of());

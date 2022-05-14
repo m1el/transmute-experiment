@@ -6,7 +6,7 @@ use crate::inst::*;
 pub struct Compiler {
     pub endian: Endian,
     pub layout: Layout,
-    pub insts: Vec<InstB>,
+    pub insts: Vec<Inst>,
     pub priv_depth: usize,
 }
 
@@ -29,11 +29,11 @@ impl Compiler {
                 // self.insts.extend(literal.map(Inst::Bytes));
             }
             Ty::Bool => {
-                self.repeat_byte(1, &[(0, 1)]);
+                self.repeat_byte(1, (0, 1));
                 self.layout = self.layout.extend(layout).unwrap().0;
             }
             Ty::Int(size) => {
-                self.repeat_byte(size, &[(0, 255)]);
+                self.repeat_byte(size, (0, 255));
                 self.layout = self.layout.extend(layout).unwrap().0;
             }
             Ty::Ptr(ref _ptr) => {
@@ -43,20 +43,8 @@ impl Compiler {
                 unimplemented!();
             }
             Ty::Array(ref array) => {
-                match array.count {
-                    0 => {}
-                    1 => {
-                        self.extend_from_ty(&array.element);
-                    }
-                    _ => {
-                        let orig_layout = self.layout;
-                        self.insts.push(Inst::Repeat(InstRepeat {
-                            count: array.count as u32,
-                        }));
-                        self.extend_from_ty(&array.element);
-                        self.insts.push(Inst::GroupEnd);
-                        self.layout = orig_layout.extend(layout).unwrap().0;
-                    }
+                for _ in 0..array.count {
+                    self.extend_from_ty(&array.element);
                 }
             }
             Ty::Struct(ref s_def) => {
@@ -84,11 +72,12 @@ impl Compiler {
                         self.insts[prev_split].patch_split(split as InstPtr);
                     }
                     prev_patch = Some(split);
-                    patches.push(split);
                     self.insts.push(Inst::new_invalid_split());
 
                     self.extend_enum_variant(e_def, variant);
-                    self.insts.push(Inst::GroupEnd);
+
+                    patches.push(self.insts.len());
+                    self.insts.push(Inst::new_invalid_goto());
                     self.layout = orig_layout;
                 }
 
@@ -98,10 +87,11 @@ impl Compiler {
                 }
 
                 self.extend_enum_variant(e_def, last_variant);
-
                 let ip = self.insts.len() as InstPtr;
+                self.insts.push(Inst::JoinLast);
+
                 for patch in patches {
-                    self.insts[patch].patch_split_end(ip);
+                    self.insts[patch].patch_goto(ip);
                 }
             }
             Ty::Union(ref u_def) => {
@@ -119,11 +109,11 @@ impl Compiler {
                         self.insts[prev_split].patch_split(split as InstPtr);
                     }
                     prev_patch = Some(split);
-                    patches.push(split);
                     self.insts.push(Inst::new_invalid_split());
 
                     self.extend_union_variant(u_def, variant);
-                    self.insts.push(Inst::GroupEnd);
+                    patches.push(self.insts.len());
+                    self.insts.push(Inst::new_invalid_goto());
                     self.layout = orig_layout;
                 }
 
@@ -133,10 +123,11 @@ impl Compiler {
                 }
 
                 self.extend_union_variant(u_def, last_variant);
-
                 let ip = self.insts.len() as InstPtr;
+                self.insts.push(Inst::JoinLast);
+
                 for patch in patches {
-                    self.insts[patch].patch_split_end(ip);
+                    self.insts[patch].patch_goto(ip);
                 }
             }
         }
@@ -152,10 +143,9 @@ impl Compiler {
     fn extend_enum_variant(&mut self, e_def: &Enum, variant: &EnumVariant) {
         let endian = self.endian;
         let private = self.priv_depth > 0;
-        let tag = InstBytes::<Box<[u8]>>::for_literal(
-                endian, e_def.tag_layout.size(), variant.disc
-            )
-            .map(|bytes| Inst::Bytes(bytes.with_private(private)));
+        let tag = InstByte::for_literal(
+                endian, e_def.tag_layout.size(), variant.disc, private
+            );
         self.insts.extend(tag);
         self.layout = self.layout.extend(e_def.tag_layout).unwrap().0;
         self.pad_to_align(e_def.payload_layout.align());
@@ -164,16 +154,10 @@ impl Compiler {
         self.pad(e_def.payload_layout.size() - variant_layout.size());
     }
     fn repeat_with<F>(&mut self, count: u32, f: F)
-        where F: Fn() -> InstB
+        where F: Fn() -> Inst
     {
-        if count <= 3 {
-            for _ in 0..count {
-                self.insts.push(f());
-            }
-        } else {
-            self.insts.push(Inst::Repeat(InstRepeat { count }));
+        for _ in 0..count {
             self.insts.push(f());
-            self.insts.push(Inst::GroupEnd);
         }
     }
     fn pad(&mut self, padding: usize) {
@@ -186,11 +170,11 @@ impl Compiler {
         let padding = self.layout.padding_needed_for(align);
         self.pad(padding);
     }
-    fn repeat_byte(&mut self, size: u32, byte_ranges: &[(u8, u8)]) {
+    fn repeat_byte(&mut self, size: u32, byte_ranges: (u8, u8)) {
         let private = self.priv_depth > 0;
-        self.repeat_with(size, || Inst::ByteRanges(InstByteRanges {
+        self.repeat_with(size, || Inst::ByteRange(InstByteRange {
             private,
-            ranges: byte_ranges.to_vec().into_boxed_slice(),
+            range: byte_ranges,
         }));
     }
 }
