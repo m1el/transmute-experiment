@@ -19,6 +19,12 @@ impl Compiler {
             priv_depth: 0,
         }
     }
+    pub fn compile(ty: &Ty, endian: Endian, name: &'static str) -> Program {
+        let mut compiler = Self::new(endian);
+        compiler.extend_from_ty(ty);
+        compiler.insts.push(Inst::Accept);
+        Program::new(compiler.insts, name)
+    }
     pub fn extend_from_ty(&mut self, ty: &Ty) {
         let layout = layout_of(ty);
         self.layout = self.layout.align_to(layout.align()).unwrap();
@@ -29,11 +35,11 @@ impl Compiler {
                 // self.insts.extend(literal.map(Inst::Bytes));
             }
             Ty::Bool => {
-                self.repeat_byte(1, (0, 1));
+                self.repeat_byte(1, (0..=1).into());
                 self.layout = self.layout.extend(layout).unwrap().0;
             }
             Ty::Int(size) => {
-                self.repeat_byte(size, (0, 255));
+                self.repeat_byte(size, (0..=255).into());
                 self.layout = self.layout.extend(layout).unwrap().0;
             }
             Ty::Ptr(ref _ptr) => {
@@ -88,11 +94,12 @@ impl Compiler {
 
                 self.extend_enum_variant(e_def, last_variant);
                 let ip = self.insts.len() as InstPtr;
-                self.insts.push(Inst::JoinLast);
+                // self.insts.push(Inst::Join);
 
                 for patch in patches {
                     self.insts[patch].patch_goto(ip);
                 }
+
             }
             Ty::Union(ref u_def) => {
                 assert!(!u_def.variants.is_empty(), "zero-variant enum isn't repr-c");
@@ -124,7 +131,7 @@ impl Compiler {
 
                 self.extend_union_variant(u_def, last_variant);
                 let ip = self.insts.len() as InstPtr;
-                self.insts.push(Inst::JoinLast);
+                // self.insts.push(Inst::Join);
 
                 for patch in patches {
                     self.insts[patch].patch_goto(ip);
@@ -170,11 +177,12 @@ impl Compiler {
         let padding = self.layout.padding_needed_for(align);
         self.pad(padding);
     }
-    fn repeat_byte(&mut self, size: u32, byte_ranges: (u8, u8)) {
+    fn repeat_byte(&mut self, size: u32, byte_ranges: RangeInclusive) {
         let private = self.priv_depth > 0;
         self.repeat_with(size, || Inst::ByteRange(InstByteRange {
             private,
             range: byte_ranges,
+            alternate: None,
         }));
     }
 }
